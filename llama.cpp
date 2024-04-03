@@ -6417,6 +6417,69 @@ struct llm_build_context {
                 // compute expert outputs
                 ggml_tensor * moe_out = nullptr;
 
+                // mmid returns the output as a 3d tensor [expert 0][expert 1][expert 2]...
+                ggml_tensor * up = ggml_mul_mat_id(ctx0, model.layers[il].ffn_up_exps, selected_experts, cur); // [n_ff, n_tokens, n_expert_used]
+                cb(up, "ffn_moe_up", il);
+                //printf("%s: [%ld %ld %ld %ld]\n", up->name, up->ne[0], up->ne[1], up->ne[2], up->ne[3]);
+
+                ggml_tensor * gate = ggml_mul_mat_id(ctx0, model.layers[il].ffn_gate_exps, selected_experts, cur); // [n_ff, n_tokens, n_expert_used]
+                cb(gate, "ffn_moe_gate", il);
+                //printf("%s: [%ld %ld %ld %ld]\n", gate->name, gate->ne[0], gate->ne[1], gate->ne[2], gate->ne[3]);
+
+                gate = ggml_silu(ctx0, gate);
+                cb(gate, "ffn_moe_silu", il);
+
+                ggml_tensor * expert = ggml_mul(ctx0, up, gate); // [n_ff, n_tokens, n_expert_used]
+                cb(expert, "ffn_moe_gate_par", il);
+                //printf("%s: [%ld %ld %ld %ld]\n", expert->name, expert->ne[0], expert->ne[1], expert->ne[2], expert->ne[3]);
+
+                // this gets weird
+                // the correct output should be [n_embd, n_tokens, n_expert_used]
+                // basically, we should be multiplying each expert by its down matrix
+                // so:
+                // selected_experts = [n_tokens, n_expert_used] (n_expert_used = 2)
+                // [n_ff, n_tokens, 0] x ffn_down_exps[selected_experts[0]]
+                // [n_ff, n_tokens, 1] x ffn_down_exps[selected_experts[1]]
+                // etc
+                // but does this make sense?
+                // with 2d b what would happen is very different:
+                // [n_embd, n_tokens] x ffn_up_exps[selected_experts[0]]
+                // [n_embd, n_tokens] x ffn_up_exps[selected_experts[1]]
+                // etc
+                // so this looks like broadcasting? except that we broadcast by selected_experts.ne[0]
+
+                //expert = ggml_mul_mat_id(ctx0, model.layers[il].ffn_down_exps, selected_experts, expert); // [n_embd, n_tokens, n_expert_used]
+                //cb(expert, "ffn_moe_down", il);
+
+
+                //printf("expert: [%ld %ld %ld %ld]\n", expert->ne[0], expert->ne[1], expert->ne[2], expert->ne[3]);
+                // now the tricky part: we need to combinate the expert fragments into the final output, weighted by the probs
+                for (int i = 0; i < n_expert_used; ++i) {
+                    //ggml_tensor * this_expert = ggml_view_2d(ctx0, expert, n_embd, n_tokens, expert->nb[1], i*expert->nb[2]);
+                    GGML_ASSERT(expert->ne[0] == hparams.n_ff);
+                    GGML_ASSERT(expert->ne[1] == n_tokens);
+                    GGML_ASSERT(expert->ne[2] == n_expert_used);
+                    ggml_tensor * this_expert = ggml_view_2d(ctx0, expert, hparams.n_ff, n_tokens, expert->nb[1], i*expert->nb[2]);
+
+                    ggml_tensor * this_sel_expert = ggml_view_2d(ctx0, selected_experts, 1, n_tokens, selected_experts->nb[1], i*selected_experts->nb[0]);
+                    this_expert = ggml_mul_mat_id(ctx0, model.layers[il].ffn_down_exps, this_sel_expert, this_expert); // [n_embd, n_tokens, n_expert_used]
+                    cb(this_expert, "ffn_moe_down", il);
+
+
+                    ggml_tensor * cur_expert = ggml_mul(ctx0, this_expert,
+                            ggml_view_2d(ctx0, weights, 1, n_tokens, weights->nb[1], i*weights->nb[0]));
+                    if (i == 0) {
+                        moe_out = cur_expert;
+                    } else {
+                        moe_out = ggml_add(ctx0, moe_out, cur_expert);
+                    }
+                }
+
+                GGML_ASSERT(moe_out->ne[0] == n_embd);
+                GGML_ASSERT(moe_out->ne[1] == n_tokens);
+                GGML_ASSERT(moe_out->ne[2] == 1);
+
+#if 0
                 for (int i = 0; i < n_expert_used; ++i) {
                     ggml_tensor * cur_expert;
 
@@ -6446,6 +6509,7 @@ struct llm_build_context {
                         cb(moe_out, "ffn_moe_out", il);
                     }
                 }
+#endif
 
                 cur = moe_out;
             }
@@ -6953,11 +7017,12 @@ struct llm_build_context {
 
             for (int i = 0; i < n_expert_used; ++i) {
                 ggml_tensor * cur_expert;
+                // FIXME
 
-                ggml_tensor * cur_up = ggml_mul_mat_id(ctx0, model.layers[il].ffn_up_exps, selected_experts, i, cur);
+                ggml_tensor * cur_up = ggml_mul_mat_id(ctx0, model.layers[il].ffn_up_exps, selected_experts, cur);
                 cb(cur_up, "ffn_moe_up", il);
 
-                ggml_tensor * cur_gate = ggml_mul_mat_id(ctx0, model.layers[il].ffn_gate_exps, selected_experts, i, cur);
+                ggml_tensor * cur_gate = ggml_mul_mat_id(ctx0, model.layers[il].ffn_gate_exps, selected_experts, cur);
                 cb(cur_gate, "ffn_moe_gate", il);
 
                 //GeLU
@@ -6967,7 +7032,7 @@ struct llm_build_context {
                 cur_expert = ggml_mul(ctx0, cur_up, cur_gate);
                 cb(cur_expert, "ffn_moe_gate_par", il);
 
-                cur_expert = ggml_mul_mat_id(ctx0, model.layers[il].ffn_down_exps, selected_experts, i, cur_expert); // [n_tokens, n_embd]
+                cur_expert = ggml_mul_mat_id(ctx0, model.layers[il].ffn_down_exps, selected_experts, cur_expert); // [n_tokens, n_embd]
                 cb(cur_expert, "ffn_moe_down", il);
 
                 cur_expert = ggml_mul(ctx0, cur_expert,

@@ -4573,20 +4573,16 @@ void ggml_mul_mat_set_prec(
 
 // ggml_mul_mat_id
 
-// NOTE: id will be removed in the future and instead all the experts listed in ids will be computed
-//       this will allow computing all the used experts in a single matrix multiplication
 struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,
         struct ggml_tensor  * ids,
-        int                   id,
         struct ggml_tensor  * b) {
-
+    GGML_ASSERT(!ggml_is_transposed(as));
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
     GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
     GGML_ASSERT(ids->ne[1] == b->ne[1]); // must have an expert per b row
     GGML_ASSERT(ids->ne[2] == b->ne[2] && ids->ne[3] == b->ne[3]);
-    GGML_ASSERT(id >= 0 && id < ids->ne[0]); // valid id
     GGML_ASSERT(as->ne[0] == b->ne[0]); // can_mul_mat
 
     bool is_node = false;
@@ -4595,10 +4591,8 @@ struct ggml_tensor * ggml_mul_mat_id(
         is_node = true;
     }
 
-    const int64_t ne[4] = { as->ne[1], b->ne[1], b->ne[2], b->ne[3] };
+    const int64_t ne[4] = { as->ne[1], b->ne[1], ids->ne[0], 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
-
-    ggml_set_op_params_i32(result, 0, id);
 
     result->op   = GGML_OP_MUL_MAT_ID;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
@@ -10960,8 +10954,8 @@ static void ggml_compute_forward_mul_mat_id(
 
     GGML_ASSERT(ne0 == ne01);
     GGML_ASSERT(ne1 == ne11);
-    GGML_ASSERT(ne2 == ne12);
-    GGML_ASSERT(ne3 == ne13);
+    //GGML_ASSERT(ne2 == ne12);
+    //GGML_ASSERT(ne3 == ne13);
 
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
@@ -10978,8 +10972,10 @@ static void ggml_compute_forward_mul_mat_id(
     assert(ne13 == 1);
 
     // row groups
-    const int id   = ggml_get_op_params_i32(dst, 0);
-    const int n_as = src0->ne[2];
+    const int n_ids = ids->ne[0]; // n_expert_used
+    const int n_as = src0->ne[2]; // n_experts
+
+    //printf("%s: %d/%d experts used\n", dst->name, n_ids, n_as);
 
     char * wdata_src1_end = (src1->type == vec_dot_type) ?
             (char *) params->wdata :
@@ -11015,13 +11011,20 @@ static void ggml_compute_forward_mul_mat_id(
         GGML_ASSERT(wdata == wdata_src1_end);
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
-        // group rows by src0 matrix
-        for (int64_t i01 = 0; i01 < ids->ne[1]; i01++) {
-            const int32_t row_id = *(const int32_t *) ((const char *) ids->data + i01*ids->nb[1] + id*ids->nb[0]);
+    #define MAKE_I64(lo, hi) (((int64_t)(lo)) | (((int64_t)(hi)) << 32))
+    #define LO_I64(i64) ((int32_t)(i64))
+    #define HI_I64(i64) ((int32_t)((i64) >> 32))
 
-            GGML_ASSERT(row_id >= 0 && row_id < n_as);
-            MMID_MATRIX_ROW(row_id, matrix_row_counts[row_id]) = i01;
-            matrix_row_counts[row_id] += 1;
+        // group rows by src0 matrix
+        for (int id = 0; id < n_ids; id++) {
+            for (int64_t i01 = 0; i01 < ids->ne[1]; i01++) {
+                const int32_t row_id = *(const int32_t *) ((const char *) ids->data + i01*ids->nb[1] + id*ids->nb[0]);
+
+                GGML_ASSERT(row_id >= 0 && row_id < n_as);
+                //MMID_MATRIX_ROW(row_id, matrix_row_counts[row_id]) = i01;
+                MMID_MATRIX_ROW(row_id, matrix_row_counts[row_id]) = MAKE_I64(i01, id);
+                matrix_row_counts[row_id] += 1;
+            }
         }
 
         return;
@@ -11087,14 +11090,17 @@ static void ggml_compute_forward_mul_mat_id(
                     const int64_t  i13 = (ir1/(ne12*cne1)); // Note: currently, src1 is always a matrix
                     const int64_t  i12 = (ir1 - i13*ne12*cne1)/cne1;
                     const int64_t _i11 = (ir1 - i13*ne12*cne1 - i12*cne1);
-                    const int64_t  i11 = MMID_MATRIX_ROW(cur_a, _i11);
+
+
+                    const int64_t  i11 = LO_I64(MMID_MATRIX_ROW(cur_a, _i11));
+                    const int id       = HI_I64(MMID_MATRIX_ROW(cur_a, _i11));
 
                     // broadcast src0 into src1
                     //const int64_t i03 = i13/r3;
                     //const int64_t i02 = i12/r2;
 
                     const int64_t i1 = i11;
-                    const int64_t i2 = i12;
+                    const int64_t i2 = id;
                     const int64_t i3 = i13;
 
                     const char * src0_row = (const char *) src0->data + src0_offset;
