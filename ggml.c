@@ -4574,6 +4574,7 @@ void ggml_mul_mat_set_prec(
 // ggml_mul_mat_id
 
 /*
+TODO: reorder arguments a,b,ids
     c = ggml_mul_mat_id(ctx, as, ids, b);
 
     as  -> [cols, rows, n_expert]
@@ -10984,9 +10985,7 @@ static void ggml_compute_forward_mul_mat_id(
 
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
-    const int n_as = src0->ne[2]; // n_experts
-
-    //printf("%s: %d/%d experts used\n", dst->name, n_ids, n_as);
+    const int n_as  = ne02;       // n_expert
 
     char * wdata_src1_end = (src1->type == vec_dot_type) ?
             (char *) params->wdata :
@@ -11026,13 +11025,13 @@ static void ggml_compute_forward_mul_mat_id(
 #define HI_I64(i64) ((int32_t)((i64) >> 32))
 
         // group rows by src0 matrix
-        for (int id = 0; id < n_ids; id++) {
-            for (int64_t i01 = 0; i01 < ids->ne[1]; i01++) {
-                const int32_t row_id = *(const int32_t *) ((const char *) ids->data + i01*ids->nb[1] + id*ids->nb[0]);
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+            for (int id = 0; id < n_ids; ++id) {
+                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 assert(row_id >= 0 && row_id < n_as);
-                MMID_MATRIX_ROW(row_id, matrix_row_counts[row_id]) = MAKE_I64(i01, id);
-                matrix_row_counts[row_id] += 1;
+                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = MAKE_I64(iid1, id);
+                matrix_row_counts[i02] += 1;
             }
         }
 
@@ -11051,7 +11050,7 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a*src0->nb[2];
+        const char * src0_cur = (const char *) src0->data + cur_a*nb02;
 
         const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
@@ -11077,10 +11076,10 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t ir111 = MIN(ir110 + dr1, nr1);
 
         // threads with no work simply yield (not sure if it helps)
-        if (ir010 >= ir011 || ir110 >= ir111) {
-            sched_yield();
-            continue;
-        }
+        //if (ir010 >= ir011 || ir110 >= ir111) {
+        //    sched_yield();
+        //    continue;
+        //}
 
         // block-tiling attempt
         const int64_t blck_0 = 16;
@@ -11120,7 +11119,9 @@ static void ggml_compute_forward_mul_mat_id(
                     for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ++ir0) {
                         vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
                     }
+
                     memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir011) - iir0)*sizeof(float));
+
                 }
             }
         }
@@ -20868,11 +20869,11 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
 
             ok = ok && cur != NULL;
 
-            ggml_set_name(cur, ctx->infos[i].name.data);
-
             if (!ok) {
                 break;
             }
+
+            ggml_set_name(cur, ctx->infos[i].name.data);
 
             // point the data member to the appropriate location in the binary blob using the tensor infos
             if (!params.no_alloc) {

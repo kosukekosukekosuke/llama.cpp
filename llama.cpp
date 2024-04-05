@@ -6392,6 +6392,7 @@ struct llm_build_context {
                         LLM_NORM_RMS, cb, il);
                 cb(cur, "ffn_norm", il);
 
+// TODO: consider f32 prec
                 ggml_tensor * logits = ggml_mul_mat(ctx0, model.layers[il].ffn_gate_inp, cur); // [n_expert, n_tokens]
                 cb(logits, "ffn_moe_logits", il);
 
@@ -6439,10 +6440,13 @@ struct llm_build_context {
                 for (int i = 0; i < n_expert_used; ++i) {
                     ggml_tensor * cur_expert = ggml_view_2d(ctx0, experts, n_embd, n_tokens,
                             experts->nb[2], i*experts->nb[1]);
+
+    // fixme: broken in cuda?
+        cur_expert=ggml_cont(ctx0, cur_expert);
                     if (i == 0) {
                         moe_out = cur_expert;
                     } else {
-                        moe_out = ggml_add(ctx0, moe_out, cur_expert);
+                        //moe_out = ggml_add(ctx0, moe_out, cur_expert);
                         cb(moe_out, "ffn_moe_out", il);
                     }
                 }
