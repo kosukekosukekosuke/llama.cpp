@@ -1,0 +1,11 @@
+NODE:
+  - id: 0
+    label: "bank"
+  - id: 1
+    label: "pharmacy"
+  - id: 2
+    label: "convenience store"
+  - id: 3
+    label: "post office"
+  - id: 4
+    label: "library"
